@@ -22,6 +22,23 @@ Windows or spinning up a VM:
 - `FileLoadException: manifest does not match (0x80131040)` — wrong DLL
   variant; replace the DLL (preferred) over fighting binding redirects
 - binding redirects in `.exe.config` `<assemblyBinding>` as a fallback
+- **Missing DirectX runtime** — `d3dx9`, `d3dcompiler_47`, `dxdiag`,
+  `xinput`/`xact`, optional `dxvk` (Vulkan-based d3d9/10/11) when a
+  Vulkan-capable GPU is available
+- **Missing fonts** — `corefonts`, `cjkfonts`, `tahoma`, plus host
+  fontconfig integration (`~/.local/share/fonts/` + `fc-cache -fv`)
+  for app-hardcoded fonts like Segoe UI
+- **Missing Visual C++ runtimes** — `vcrun6`, `vcrun2005..vcrun2019`
+  with the missing-DLL → verb mapping table (MSVCR120, MSVCP140,
+  vcruntime140, concrt140, etc.)
+- **MSI / InstallShield / NSIS installers** — `wine msiexec /i`,
+  running bundled `Setup.exe`, `winetricks isscript` for old
+  InstallShield, `winecfg` Windows version override
+- **COM / ActiveX registration** — `wine regsvr32 <dll>` when an app
+  fails with `CoGetClassObject no class object`
+- **Registry probes** — using `WINEDEBUG=reg` to find missing keys and
+  `wine reg add` / `wine regedit` to plant them (fake IE/.NET/Office
+  presence without installing those)
 - The `winetricks dotnetNNN` `remove_mono internal` loop hang and how to
   kill it safely (by PID, **not** `pkill -f winetricks` — that can hang
   matching its own shell)
@@ -34,8 +51,21 @@ in the order they surfaced and the fix for each.
 
 Trigger keywords: "exe не запускается под wine", "wine ошибка 32/64",
 "Could not load assembly", "Wine Mono is not installed",
-"FileLoadException manifest does not match", "сделай ярлык для wine
-приложения".
+"FileLoadException manifest does not match", "Failed to create
+Direct3D device", "missing MSVCR140.dll", "tofu boxes wine", "сделай
+ярлык для wine приложения".
+
+### Out of scope (the skill will say so and stop)
+
+- **Anti-cheat / kernel-level DRM** (EAC, BattlEye, Denuvo) — needs
+  Windows or a VM with GPU passthrough.
+- **Copy-protected installers** (SecuROM, StarForce, SafeDisc) — DRM
+  locked; needs Windows or a no-CD patch where legal.
+- **16-bit installers** — Wine dropped 16-bit support on 64-bit hosts;
+  use a VM (or DOSBox for pure DOS).
+- **GPU/driver problems** — fix the host driver (NVIDIA/AMD/Mesa)
+  first; the skill won't help with shader crashes from a broken
+  driver.
 
 ## Repo layout
 

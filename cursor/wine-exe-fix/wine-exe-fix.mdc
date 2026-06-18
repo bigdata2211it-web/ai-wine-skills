@@ -3,10 +3,14 @@ description: |
   Diagnose and fix Windows .exe launch failures under Wine on Linux. Covers
   32-bit vs 64-bit Wine prefix, missing .NET runtime, missing NuGet
   dependencies, assembly vs package version mismatch, binding redirects,
-  winetricks remove_mono hang, .desktop launcher creation. Triggers on
-  "exe не запускается под wine", "wine ошибка 32/64", "Could not load
-  assembly", "Wine Mono is not installed", "FileLoadException manifest does
-  not match", "сделай ярлык для wine приложения".
+  missing DirectX/D3DX/D3DCompiler runtime, missing fonts, missing Visual
+  C++ runtimes, MSI/InstallShield installers, COM/ActiveX registration,
+  registry probes via WINEDEBUG=reg, winetricks remove_mono hang, DXVK
+  acceleration, .desktop launcher creation. Triggers on "exe не запускается
+  под wine", "wine ошибка 32/64", "Could not load assembly", "Wine Mono is
+  not installed", "FileLoadException manifest does not match", "Failed to
+  create Direct3D device", "missing MSVCR140.dll", "tofu boxes wine",
+  "сделай ярлык для wine приложения".
 globs: ""
 alwaysApply: false
 ---
@@ -42,9 +46,16 @@ Use when the user says: «exe не запускается под wine», «wine 
 | Missing NuGet DLL next to `.exe` | Yes — fetch from nuget.org, drop in app folder |
 | Wrong assembly version of a DLL | Yes — pick the right `lib/netXX/` variant |
 | binding redirect needed | Yes — edit `.exe.config` `<assemblyBinding>` |
-| Anti-cheat / kernel-level DRM | **No** — needs Windows or a VM with GPU passthrough |
-| Native MSVC runtime crash | Partially — try `winetricks vcrun2019`; out of scope if it persists |
-| GPU/driver issues | Out of scope — fix the host driver (NVIDIA/AMD/Mesa) first |
+| Missing DirectX (9/10/11) runtime or DLLs | Yes — `winetricks d3dx9 d3dcompiler_47 dxdiag` etc. |
+| Missing fonts (tofu / wrong glyphs) | Yes — `winetricks corefonts cjkfonts` |
+| Missing Visual C++ runtime | Yes — `winetricks vcrun6 vcrun2005 vcrun2008 vcrun2010 vcrun2012 vcrun2013 vcrun2019` |
+| Missing COM/ActiveX component | Partially — `regsvr32 <dll>`; DCOM/config beyond registry is out of scope |
+| MSI installer with custom actions | Partially — `wine msiexec /i`; native InstallShield bootstrappers often fail |
+| Registry stub missing / wrong value | Yes — `wine reg add` / `wine regedit` to plant the expected keys |
+| Anti-cheat / kernel-level DRM (EAC, BattlEye, Denuvo) | **No** — needs Windows or a VM with GPU passthrough |
+| GPU/driver issues (shader crashes, no hw accel) | Out of scope — fix the host driver (NVIDIA/AMD/Mesa) first |
+| copy-protected installers (SecuROM, StarForce, SafeDisc) | **No** — DRM-locked; needs Windows or no-CD patch |
+| 16-bit installers | **No** — Wine dropped 16-bit support on 64-bit hosts; use a VM (DOSBox for pure DOS) |
 
 ## Prerequisites (host)
 
@@ -264,7 +275,164 @@ Caveat: Option B only works if the DLL is **binary-compatible** with
 the reference (same public API). For patch-version differences it
 usually is; for major-version jumps it often isn't.
 
-### Step 6 — Create a `.desktop` launcher (so the user can double-click)
+### Step 6 — Provide DirectX runtime and DLLs
+
+Common symptoms:
+- `err:d3d:...` or `fixme:d3d:...` spam in the log, then crash.
+- App complains about missing `d3dx9_XX.dll`, `d3dcompiler_XX.dll`,
+  `D3DX9_43.dll`, `xinput1_3.dll`, `xactengine*.dll`.
+- Black window, no rendering, or "Failed to create Direct3D device".
+
+Fix via winetricks (install into the same prefix as the app):
+```bash
+WINEPREFIX=/home/USER/.wine32 winetricks --unattended \
+  d3dx9 d3dx10 d3dx11_42 d3dx11_43 \
+  d3dcompiler_47 d3dcompiler_43 \
+  dxdiag dxvk \
+  xinput xact
+```
+Verb glossary:
+- `d3dx9` — installs the whole DirectX 9 D3DX family (d3dx9_24..43).
+- `d3dcompiler_47` — modern HLSL compiler, used by many .NET/WinForms
+  apps that ship CefSharp or WPF.
+- `dxdiag` — the DirectX Diagnostic Tool + the `dxgi.dll`/`d3d11.dll`
+  stubs some apps probe for at startup.
+- `xinput` / `xact` — Xbox controller + XAudio (game-ish apps).
+- `dxvk` — **optional but high-impact**: replaces Wine's d3d9/10/11
+  with Vulkan-based implementations via DXVK. Big win for games and
+  for .NET apps that use hardware-accelerated rendering. Requires
+  Vulkan-capable GPU + `vulkan-tools` installed on the host. Verify:
+  `vulkaninfo | head -5`. If no Vulkan, skip `dxvk`.
+
+For apps that bundle their own DirectX installer (`DXSETUP.exe`,
+`vcredist_x86.exe`), prefer running those bundled installers **inside
+the prefix** over winetricks when possible:
+```bash
+WINEPREFIX=/home/USER/.wine32 wine "/path/to/app/Redist/DXSETUP.exe"
+```
+
+### Step 7 — Provide fonts (fixes "tofu" boxes and broken layout)
+
+Symptoms:
+- Text shows as rectangles/boxes ("tofu").
+- WinForms controls render with wrong metrics, UI overlaps.
+- App crashes drawing a specific font that isn't present.
+
+Fix:
+```bash
+WINEPREFIX=/home/USER/.wine32 winetricks --unattended corefonts
+# for CJK / Cyrillic / other scripts:
+WINEPREFIX=/home/USER/.wine32 winetricks --unattended cjkfonts
+# also: install tahoma (many MS apps hardcode Tahoma):
+WINEPREFIX=/home/USER/.wine32 winetricks --uninstalled tahoma
+```
+If the app hardcodes a font not in `corefonts` (e.g. `Segoe UI`), the
+cleanest fix is to install the font system-wide on the host and let
+fontconfig expose it to Wine:
+```bash
+sudo apt install fonts-dejavu fonts-liberation
+# copy any custom .ttf to ~/.local/share/fonts/ and run:
+fc-cache -fv
+```
+Wine reads fontconfig; host fonts become available without restarting
+the prefix.
+
+### Step 8 — Provide Visual C++ runtime (MSVCRT / VC++ Redistributable)
+
+Many apps ship without the VC++ runtime they were built against. Error
+variants:
+- `err:module:import_dll Library MSVCR120.dll not found`
+- `err:module:import_dll Library MSVCP140.dll not found`
+- App launches then immediately exits with no message (missing
+  `_Crt*` symbols).
+
+Map the missing DLL to the right verb:
+| Missing DLL | winetricks verb |
+|-------------|-----------------|
+| `MSVCRT.dll`, `MSVCR60.dll` | `vcrun6` |
+| `MSVCR80.dll`, `MSVCP80.dll` | `vcrun2005` |
+| `MSVCR90.dll`, `MSVCP90.dll` | `vcrun2008` |
+| `MSVCR100.dll`, `MSVCP100.dll` | `vcrun2010` |
+| `MSVCR110.dll`, `MSVCP110.dll` | `vcrun2012` |
+| `MSVCR120.dll`, `MSVCP120.dll` | `vcrun2013` |
+| `MSVCR140.dll`, `MSVCP140.dll`, `vcruntime140.dll`, `concrt140.dll` | `vcrun2015` (also installs 2017/2019/2022) |
+| `MSVCP140_1.dll`, `MSVCP140_2.dll` | `vcrun2019` (newer variant) |
+
+Install:
+```bash
+WINEPREFIX=/home/USER/.wine32 winetricks --unattended vcrun2019
+```
+Install only what the error names — installing all of them at once can
+cause DLL conflicts (different MSVCRT versions overwrite each other).
+
+### Step 9 — MSI installers and bundled redistributables
+
+If the app ships as `setup.msi` or `Setup.exe` (InstallShield/NSIS/Inno):
+```bash
+WINEPREFIX=/home/USER/.wine32 wine msiexec /i "/path/to/setup.msi"
+# or for .exe bootstrappers:
+WINEPREFIX=/home/USER/.wine32 wine "/path/to/Setup.exe"
+```
+Tips:
+- Add `/qn` for silent MSI: `msiexec /i setup.msi /qn` (still uses
+  the prefix's C: drive).
+- InstallShield `Setup.exe` that fails with "ISScript.msi" error →
+  install `winetricks isscript` first.
+- For very old NSIS installers that hang at "Extracting...", running
+  with `WINEDEBUG=-all` can help (NSIS spams fixme channels).
+- If the installer needs Windows version 10 set: open
+  `WINEPREFIX=/home/USER/.wine32 winecfg` → Windows version → Windows 10.
+
+### Step 10 — Register COM / ActiveX components
+
+If the error is `err:ole:CoGetClassObject no class object` for a CLSID,
+or the app tries `regsvr32 <dll>` and fails, register the DLL manually:
+```bash
+WINEPREFIX=/home/USER/.wine32 wine regsvr32 "/path/to/component.dll"
+```
+For 32-bit DLLs in a win32 prefix this just works. For 64-bit DLLs in
+a wow64 prefix use `wine64 regsvr32`.
+
+If the CLSID is not in any DLL you have (the component is genuinely
+missing from the app's bundle), this is out of scope — Wine cannot
+invent a COM object. Look for a redistributable installer from the
+vendor (e.g. "MS XML Core Services", "WebView2 Runtime").
+
+### Step 11 — Plant registry keys the app probes for
+
+Some apps check for registry keys before doing work (e.g. "is
+Internet Explorer >= 7?", "is .NET 4 installed?", "is Office
+installed?") and bail out if the key is missing even when the actual
+feature isn't used.
+
+Inspect what's missing by running with `WINEDEBUG=reg`:
+```bash
+WINEPREFIX=/home/USER/.wine32 WINEDEBUG=reg wine "/path/to/App.exe" 2>&1 | \
+  grep -iE "RegOpenKey|RegQueryValue" | head -30
+```
+Look for keys returning `STATUS_OBJECT_NAME_NOT_FOUND`. Plant them:
+```bash
+WINEPREFIX=/home/USER/.wine32 wine reg add \
+  "HKLM\\Software\\Microsoft\\Internet Explorer" /v Version /t REG_SZ \
+  /d "9.11.10240.16384" /f
+```
+Or edit interactively:
+```bash
+WINEPREFIX=/home/USER/.wine32 wine regedit
+```
+Back up the registry first:
+```bash
+cp -r /home/USER/.wine32/system.reg /home/USER/.wine32/system.reg.bak
+cp -r /home/USER/.wine32/user.reg  /home/USER/.wine32/user.reg.bak
+```
+Common keys apps probe:
+- `HKLM\Software\Microsoft\Internet Explorer\Version` — fake IE version.
+- `HKLM\Software\Microsoft\NET Framework Setup\NDP\v4\Full\Version` —
+  fake .NET 4.x presence (only if `dotnet40` already installed).
+- `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\...` —
+  install records some launchers check.
+
+### Step 12 — Create a `.desktop` launcher (so the user can double-click)
 
 Wine's `wine-binfmt` registers `.exe` to run with `wine` — but it uses
 the **default** `~/.wine` prefix, which is wrong for any app that needs
@@ -392,6 +560,28 @@ WINEPREFIX=/home/den/.wine32 WINEDEBUG=-all \
 9. **Files inside a cryfs/FUSE vault are transparent to Wine.** No
    need to copy out; just open the vault before launching and close
    after.
+10. **DirectX/D3DX missing is the #1 cause of "Failed to create
+    Direct3D device"**. `winetricks d3dx9 d3dcompiler_47` fixes most
+    .NET WinForms + CefSharp apps. `dxvk` is a major upgrade for
+    GPU-accelerated rendering if Vulkan is available.
+11. **Fonts come from fontconfig**. If an app hardcodes a font Wine
+    doesn't have, install the `.ttf` on the host
+    (`~/.local/share/fonts/`) and run `fc-cache -fv` — Wine picks it
+    up without a prefix restart.
+12. **VC++ runtime: install only the version the error names.**
+    Installing all `vcrun*` verbs at once causes DLL conflicts —
+    different MSVCRT versions overwrite each other. Map the missing
+    DLL to the right verb (see Step 8 table).
+13. **`WINEDEBUG=reg` reveals registry probes.** Apps that bail with
+    "needs IE 7" or "needs Office" usually just check a registry key —
+    plant it via `wine reg add` or `wine regedit` instead of actually
+    installing IE/Office.
+14. **Prefer the app's bundled redistributables over winetricks** when
+    the app ships `Redist/DXSETUP.exe` or `vcredist_x86.exe` — the
+    app expects its exact version.
+15. **Anti-cheat / kernel DRM / copy-protected installers cannot be
+    fixed in Wine.** Stop early and recommend a Windows VM with GPU
+    passthrough (or a no-CD patch for old games, where legal).
 
 ## Diagnostic commands cheat sheet
 
@@ -400,11 +590,22 @@ file <exe>                              # PE32 (i386) = 32-bit; PE32+ = 64-bit
 strings <dll> | grep -E "^[0-9]+\."     # quick assembly version probe
 monodis --assembly <dll> | grep Version # authoritative assembly version
 WINEPREFIX=... winetricks list-installed
+WINEPREFIX=... winetricks dlls list     # show available winetricks verbs
 WINEPREFIX=... wineserver -k            # stop all wine procs in that prefix
+WINEPREFIX=... wineboot -r              # restart the prefix (re-scan fonts/reg)
+WINEPREFIX=... winecfg                  # GUI: windows version, drives, audio
+WINEPREFIX=... wine regedit             # GUI registry editor
+WINEPREFIX=... wine reg add "HKLM\\..." /v X /t REG_SZ /d Y /f  # plant a key
+WINEPREFIX=... wine regsvr32 <dll>      # register COM/ActiveX component
+WINEPREFIX=... wine msiexec /i setup.msi /qn   # silent MSI install
 WINEDEBUG=-all wine ...                 # silent launch
 WINEDEBUG=warn wine ...                 # show err:/warn:, hide fixme:
+WINEDEBUG=reg wine ... 2>&1 | grep RegOpenKey   # see what registry keys the app probes
+WINEDEBUG=module wine ... 2>&1 | grep import_dll  # see what DLLs the app fails to load
 pgrep -af <pattern>                     # list PIDs before kill
 mountpoint <path>                       # is a FUSE/cryfs mount active?
+vulkaninfo | head -5                    # is Vulkan available for DXVK?
+fc-cache -fv                            # rebuild font cache (Wine reads fontconfig)
 curl -sL "https://api.nuget.org/v3-flatcontainer/<pkg>/index.json"
 ```
 
